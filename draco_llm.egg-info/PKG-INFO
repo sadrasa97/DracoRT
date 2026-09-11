@@ -1,0 +1,1342 @@
+Metadata-Version: 2.4
+Name: draco-llm
+Version: 0.8.0
+Summary: Universal GPU LLM Runtime
+Author: Draco Team
+License: Apache-2.0
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.1.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: safetensors>=0.4.0
+Requires-Dist: huggingface-hub>=0.20.0
+Requires-Dist: transformers>=4.37.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: filelock>=3.13.0
+Requires-Dist: tqdm>=4.66.0
+Requires-Dist: py-cpuinfo>=9.0.0
+Requires-Dist: aiohttp>=3.9.0
+Provides-Extra: quantization
+Requires-Dist: auto-gptq>=0.7.0; extra == "quantization"
+Requires-Dist: autoawq>=0.2.0; extra == "quantization"
+Requires-Dist: bitsandbytes>=0.43.0; extra == "quantization"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23.0; extra == "dev"
+Requires-Dist: ruff>=0.2.0; extra == "dev"
+Requires-Dist: mypy>=1.8.0; extra == "dev"
+Requires-Dist: black>=24.0.0; extra == "dev"
+Provides-Extra: bench
+Requires-Dist: pandas>=2.1.0; extra == "bench"
+Requires-Dist: matplotlib>=3.8.0; extra == "bench"
+Requires-Dist: tabulate>=0.9.0; extra == "bench"
+Provides-Extra: all
+Requires-Dist: draco-llm[bench,dev,quantization]; extra == "all"
+
+# Draco — Universal GPU + CPU LLM Runtime
+
+**Version 0.8.0** | 821 GPU-path tests passing | 69 native-CPU-runtime + GPU-memory-utility tests passing | dual-backend `LLM(backend=...)` — `transformers` (default) or `draco` (native) | 13 model adapters | 3 CPU-executor architecture families (RoPE/RMSNorm/gated, learned-pos/LayerNorm/fused-QKV, ALiBi) | 5 CPU quantization/storage formats | 5 benchmark modes | OpenAI server | PagedAttention | Pipeline Parallelism | Health Checks | Production Benchmarks | Native CPU Runtime | `.draco` format | GPU OOM-avoidance
+
+A plugin/registry-based inference runtime for HuggingFace causal language models, with two execution backends sharing one model format and one scheduler:
+
+- **GPU backend** — the original vLLM-compatible engine: PagedAttention, tensor/pipeline parallelism, continuous batching, speculative decoding, an OpenAI-compatible server.
+- **Native CPU backend** — no PyTorch in the hot path. A self-contained, memory-mapped `.draco` model format (conceptually: llama.cpp + GGUF, built natively inside Draco) with CPU-native INT8/INT4 weight quantization, a pure-numpy execution graph, its own KV cache, continuous batching (reusing the same scheduler as the GPU path), and adaptive draft-model-free speculative decoding.
+
+`device="auto"` picks between them based on detected hardware and the model's own metadata — see [Native CPU Runtime](#native-cpu-runtime).
+
+### Which model-loading backend: `transformers` vs `draco`
+
+`LLM(...)` also has a separate, higher-level `backend` switch — independent from the CPU/GPU `device` choice above — that decides how the model is loaded and run:
+
+```python
+from draco import LLM
+
+# Default: backend="transformers" — delegates model loading and the whole
+# generate() loop to the installed transformers library. Supports whatever
+# architectures your transformers version supports (text-only or
+# text+vision "ForConditionalGeneration" models), with transformers' own
+# correct, KV-cached generation. Use this unless you have a specific
+# reason not to.
+llm = LLM(model="Qwen/Qwen2.5-0.5B-Instruct")
+
+# Explicit opt-in: Draco's own native CPU/GPU engine and model adapters
+# (MODEL_REGISTRY). Only architectures registered there are supported —
+# unsupported ones raise ModelNotFoundError with a suggestion to drop
+# back to backend="transformers".
+llm = LLM(model="Qwen/Qwen2.5-0.5B-Instruct", backend="draco")
+```
+
+`backend="transformers"` is the default specifically because it is the reliable path: it supports any architecture your installed transformers version does (via an `AutoModelForCausalLM` → `AutoModelForImageTextToText` → `AutoModelForVision2Seq` → `AutoModel` fallback chain, so text+vision models load too, not just text-only ones), and it reuses transformers' own `.generate()` — which handles KV caching and position ids correctly out of the box. `backend="draco"` gives you Draco's own adapters, which is where architecture support and the CPU/GPU device choice above apply; it is more limited (25 registered architectures) and, prior to v0.8.0, had a real correctness bug in its no-KV-cache generation loop (fixed — see [Known Limitations](#known-limitations)).
+
+```
+python demo.py            # Run all 38 demo sections
+python demo.py 1 3 5      # Run specific sections
+python -m pytest tests/ -v  # Run the GPU-path test suite (needs torch)
+python -m pytest tests/format tests/runtime_cpu -v  # Native CPU runtime (numpy only, no torch needed)
+```
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Native CPU Runtime](#native-cpu-runtime)
+- [Supported Models](#supported-models)
+- [Quantization](#quantization)
+- [Engine API](#engine-api)
+- [Model Registry](#model-registry)
+- [Metrics System](#metrics-system)
+- [Benchmarking](#benchmarking)
+- [CLI Reference](#cli-reference)
+- [Weight Loading](#weight-loading)
+- [Attention Backends](#attention-backends)
+- [Position Encodings](#position-encodings)
+- [Mixture of Experts](#mixture-of-experts)
+- [Error Handling](#error-handling)
+- [Configuration](#configuration)
+- [Logging](#logging)
+- [Project Structure](#project-structure)
+- [Test Suite](#test-suite)
+- [Demo](#demo)
+- [Contributing](#contributing)
+- [Installation](#installation)
+- [Requirements](#requirements)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+---
+
+## Quick Start
+
+```python
+from draco import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Llama-3-8B",
+    dtype="bfloat16",
+    max_model_len=32768,
+    gpu_memory_utilization=0.90,
+)
+
+sampling_params = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    top_k=50,
+    max_tokens=256,
+)
+
+outputs = llm.generate(
+    ["Hello, how are you?"],
+    sampling_params,
+)
+
+for output in outputs:
+    print(output.outputs[0].text)
+```
+
+### Quantized models
+
+```python
+# Auto-detect from checkpoint metadata
+llm = LLM(model="TheBloke/Llama-2-7B-Chat-GPTQ")
+
+# Explicit quantization
+llm = LLM(model="model-path", quantization="gptq")
+
+# List supported quantization backends
+from draco import QUANT_REGISTRY
+print(QUANT_REGISTRY.list_methods())  # ['awq', 'bitsandbytes', 'fp8', 'gptq']
+```
+
+### Metrics
+
+```python
+metrics = llm.metrics()
+print(f"TTFT:          {metrics.request.ttft_ms:.1f} ms")
+print(f"ITL:           {metrics.request.itl_ms:.1f} ms")
+print(f"TPOT:          {metrics.request.tpot_ms:.1f} ms")
+print(f"Throughput:    {metrics.generation.tokens_per_second:.1f} tok/s")
+print(f"GPU Memory:    {metrics.gpu.allocated_memory_gb:.2f} GB")
+print(f"Speculative:   {metrics.speculative.acceptance_rate:.2%}")
+print(f"Quantization:  {metrics.quantization.quantization_method}")
+```
+
+---
+
+## Architecture
+
+```
+                        Draco
+                           |
+                  +--------+---------+
+                  |                  |
+              Python API        C++/CUDA Runtime
+                  |                  |
+              LLM Engine          Scheduler
+                  |                  |
+            Model Registry       Request Manager
+                  |                  |
+            Model Executor       KV Cache Manager
+                  |                  |
+           +------+-------+      Paged KV Cache
+           |              |             |
+        Dense Models    MoE       PagedAttention
+           |              |             |
+           +------+-------+-------------+
+                  |
+           Quantization Layer
+                  |
+         +--------+---------+
+         |        |         |
+        GPTQ     AWQ       FP8
+         |        |         |
+         +--------+---------+
+                  |
+          Speculative Decoding
+                  |
+           Multi-GPU / NCCL
+                  |
+              CUDA Kernels
+                  |
+                 GPU
+                  |
+            Metrics System
+                  |
+           Benchmark System
+```
+
+### What each layer does
+
+| Layer | Module | Status |
+|-------|--------|--------|
+| Python API | `LLM`, `SamplingParams` | Working |
+| Model Registry | `MODEL_REGISTRY` plugin system | Working |
+| Model Adapters | 7 adapters, 16+ architectures | Working |
+| Model Executor | Forward pass orchestration | Working |
+| Model Runner | Weight loading + init | Working |
+| Attention | MHA, GQA, MQA, SlidingWindow | Working |
+| Position Encoding | RoPE, NTK-aware, YaRN, ALiBi | Working |
+| MoE | Router, Expert, Dispatcher | Working |
+| Quantization | GPTQ, AWQ, FP8, bitsandbytes | Working |
+| Metrics | Collector, 8 metric types, Prometheus | Working |
+| Benchmarks | 5 modes, comparison, persistence | Working |
+| Weight Loading | Safetensors, PyTorch, HF, sharded | Working |
+| CLI | bench, bench-compare, info | Working |
+| Paged KV Cache | Block-based cache, allocation/deallocation | Working |
+| Continuous Batching | Dynamic batching, priority, preemption | Working |
+| CUDA Kernels | Custom attention/norm kernels | Planned |
+| Streaming | Token-by-token yield, batch streaming | Working |
+| Speculative Decoding | Draft model, token verification, acceptance tracking | Working |
+| Server | OpenAI-compatible API (/v1/completions, /v1/chat/completions) | Working |
+| Prefix Cache | Radix-tree prefix caching for KV reuse | Working |
+| Chunked Prefill | Long-prompt chunking for scheduler-friendly prefill | Working |
+| Async API | Non-blocking async/await generation | Working |
+| PagedAttention | Paged KV cache attention computation | Working |
+| Rate Limiter | Token bucket rate limiting for server | Working |
+| Tensor Parallelism | Column/Row parallel linear layers | Working |
+| Pipeline Parallelism | Layer partitioning, micro-batch scheduling | Working |
+| Health Checks | Liveness, readiness, startup probes | Working |
+| Structured Logging | JSON logging, request ID tracking | Working |
+| CUDA Kernels | Fused RMSNorm, RoPE, SwiGLU, Attention (reference) | Working |
+| Multi-GPU | NCCL communication | Planned |
+
+---
+
+## Native CPU Runtime
+
+A second execution backend that runs entirely without PyTorch, built around one new artifact: the `.draco` file.
+
+### The `.draco` format
+
+A versioned, self-contained, memory-mapped model container — not a JSON pointer to safetensors, not a zip of the original HF files. `LLM(model="model.draco")` needs nothing else at inference time: architecture metadata, tokenizer (optional), tensor index, and tensor data all live in one file, opened via `mmap` so the OS page cache — not Python — controls what's actually resident in RAM.
+
+```python
+from draco.format import DracoWriter, DracoReader
+
+writer = DracoWriter("model.draco")
+writer.add_metadata({"architecture": "LlamaForCausalLM", "model_type": "llama", ...})
+writer.add_tensor("layers.0.self_attn.q_proj.weight", weight, quantization="int8_sym")
+writer.finalize()  # atomic: tmp file -> self-validate -> rename; a failed write never
+                   # leaves a corrupt file at the target path
+
+reader = DracoReader("model.draco")
+print(reader.architecture, reader.tensor_names())
+```
+
+```bash
+draco convert --model meta-llama/Llama-3-8B --output Llama-3-8B.draco --quantization int8
+draco inspect Llama-3-8B.draco     # architecture, quantization, tensor count, CPU kernel info
+draco validate Llama-3-8B.draco    # header/offset/bounds/checksum validation, never segfaults on corrupt input
+draco system-info                  # detected ISA (AVX2/AVX512/VNNI/AMX/NEON), thread plan, device="auto" resolution
+```
+
+### CPU-native quantization and storage formats
+
+Five formats, each with a real numpy codec and round-trip/matmul correctness tests — no format is ever exposed without a working implementation:
+
+| Format | Kind | Notes |
+|---|---|---|
+| `int8_sym` | weight-only quant | per-row symmetric, 1 byte/weight |
+| `int8_asym` | weight-only quant | per-row asymmetric (zero-point) — lower error than symmetric on off-center weight distributions |
+| `int4_groupwise` | weight-only quant | groupwise asymmetric, 2 values packed per byte |
+| `f16` | storage dtype | native numpy half precision |
+| `bf16` | storage dtype | truncated-mantissa float32 (round-to-nearest-even), no native numpy dtype so stored as raw bit patterns — half the size of f32 with f32's full exponent range (unlike f16, which can overflow on values outside its narrower range) |
+
+### Full execution graph, generalized across architecture families
+
+`draco.runtime.cpu.executor.CPUExecutionBackend` reads architecture-shape metadata from the `.draco` file (norm type, position-encoding type, MLP type, fused-vs-separate QKV, bias placement) rather than hardcoding one model family. Three families are implemented and each verified against an **independently-written plain-numpy reference forward pass** (not just "didn't crash"):
+
+| Family | Norm | Position encoding | MLP | QKV | Example models |
+|---|---|---|---|---|---|
+| Llama-style | RMSNorm | RoPE | Gated (SwiGLU) | separate q/k/v | Llama, Qwen2, Mistral |
+| GPT-2-style | LayerNorm (+bias) | Learned embedding | Standard (GELU) | fused `c_attn` | GPT-2 |
+| BLOOM-style | LayerNorm (+bias) | ALiBi | Standard (GELU) | separate q/k/v | BLOOM |
+
+This is not a claim that all 13 GPU-side model adapters run correctly on the CPU path today — attention variants like Falcon's parallel attention+MLP block or true multi-query (single shared KV head) aren't wired in — but it's real, tested breadth across the three largest architectural axes (normalization, position encoding, MLP gating), not just the one family from the previous version.
+
+```python
+from draco.runtime.cpu.llm import CPUNativeLLM
+
+llm = CPUNativeLLM("model.draco", memory_utilization=0.85)
+tokens = llm.generate([1, 2, 3], max_new_tokens=64)
+print(llm.runtime_info())
+```
+
+### Continuous batching (shared scheduler, not forked)
+
+The CPU path reuses `draco.scheduler.scheduler.ContinuousBatchScheduler` — the same request-admission bookkeeping the GPU engine uses — rather than a CPU-specific copy. `CPUBatchEngine` turns scheduled batches into prefill calls for newly-admitted sequences and a single vectorized decode call (`forward_batch_decode`) across all running sequences per step, admitting/evicting sequences from the KV cache as they start and finish.
+
+```python
+llm = CPUNativeLLM("model.draco")
+results = llm.generate_batch([[1, 2, 3], [4, 5], [6, 7, 8, 9]], max_new_tokens=64)
+```
+
+### Adaptive speculative decoding (draft-model-free)
+
+The GPU engine's speculative decoder (`draco.engine.speculative`) uses a separate draft model. The CPU path can't assume one is available, so `draco.runtime.cpu.speculative.AdaptiveSpeculativeDecoder` uses **prompt-lookup decoding**: it drafts candidate continuations by matching the last few generated tokens against earlier context (n-gram lookup, no second model needed), verifies the whole draft in one forward pass, and rolls back the KV cache for any rejected suffix. This is exact for greedy decoding — the output is token-for-token identical to plain autoregressive generation, just potentially faster on repetitive continuations (code, quoted text, structured output). Draft length adapts via an EMA of the acceptance rate: it grows after a run of good guesses and shrinks after a run of bad ones.
+
+```python
+tokens = llm.generate([1, 2, 3], max_new_tokens=64, speculative=True)
+```
+
+### Automatic memory management and device selection
+
+`draco.runtime.cpu.mem_util` detects total/available host RAM (`/proc/meminfo`) and derives a usable budget as `available × cpu_memory_utilization` (default 0.85) — the same idea as `gpu_memory_utilization` on the GPU path, but for system RAM. `draco.convert.planner.CPUQuantizationPlanner` walks quantization options from most-accurate-that-fits down given that budget, model size, and context/concurrency targets, and raises `InsufficientMemoryError` (rather than silently OOMing) when nothing fits. `draco.runtime.device_manager.resolve_device("auto", ...)` picks CPU vs. CUDA based on detected hardware and any CPU-oriented metadata embedded in the `.draco` file.
+
+### GPU-side memory planning and OOM avoidance
+
+Two additive utilities that sit alongside the existing GPU engine (`draco.engine.llm.LLM`) without modifying it — this environment has no GPU to validate engine changes against, so the engine itself is untouched, but these are independently testable:
+
+- `draco.runtime.gpu.memory.GPUMemoryPlanner` — the GPU-side counterpart to `CPUMemoryPlanner`. `auto_memory_budget()` mirrors `gpu_memory_utilization` (detects free CUDA memory via `torch.cuda.mem_get_info`, budgets a fraction of it). `max_num_seqs_that_fit()` is the actual **avoidance** mechanism: solve directly for how many concurrent sequences' worth of KV cache fit in the remaining budget after weights are loaded, so a scheduler can refuse admission past that number instead of admitting-and-hoping.
+- `draco.utils.oom_guard.run_with_oom_backoff()` — the **recovery** mechanism for when an OOM happens anyway (misestimated size, fragmentation, a concurrent process). Catches OOM-like errors (by exception type name/message, so it doesn't need a specific torch version's exception class), clears the CUDA allocator cache, backs off a memory-fraction keyword argument geometrically, and retries up to a bounded number of attempts — tested with mocked flaky/always-failing callables since there's no real GPU here to trigger a genuine OOM against.
+
+```python
+from draco.utils.oom_guard import run_with_oom_backoff, OOMRetryConfig
+
+result = run_with_oom_backoff(
+    lambda gpu_memory_utilization: my_llm.generate(prompt, gpu_memory_utilization=gpu_memory_utilization),
+    initial_value=0.9,
+    config=OOMRetryConfig(max_retries=3, backoff_factor=0.7, min_value=0.3),
+)
+```
+
+### What's real vs. reference-tier, honestly
+
+Everything above is implemented and tested end-to-end (`tests/format/`, `tests/runtime_cpu/`, `tests/runtime_gpu/`, `tests/utils/` — 69 tests total, including three independent-reference-implementation cross-checks across the three architecture families, a test that continuous-batched generation exactly matches single-sequence generation, a test that ALiBi position bias stays correct through the batched decode path specifically, and a test that speculative decoding is token-for-token lossless vs. plain greedy decoding). What's **not** built: ISA-specific CPU kernels (AVX2/AVX512/VNNI/AMX/NEON intrinsics) — the kernel dispatcher detects real CPU capabilities but only ever selects the portable numpy "generic" tier, and says so explicitly (`kernel_downgraded` in `runtime_info()`) rather than claiming a fast path that isn't there. Real ISA kernels need a compiled extension validated on real hardware, which this environment can't provide — same reason no GPU engine code was modified this round: there's no CUDA device here to test against, so the GPU-side additions are memory-planning/OOM-recovery utilities that don't require touching the (already-passing) existing engine.
+
+---
+
+## Supported Models
+
+### Active (tested forward pass)
+
+| Adapter | Architectures | Attention | Position | MLP | Tied Embeds |
+|---------|---------------|-----------|----------|-----|-------------|
+| **LlamaAdapter** | Llama, Llama 2, Llama 3/3.1/3.2/3.3, CodeLlama | GQA | RoPE | SwiGLU | No |
+| **MistralAdapter** | Mistral | GQA | RoPE | SwiGLU | No |
+| **MixtralAdapter** | Mixtral-8x7B, Mixtral-8x22B | GQA | RoPE | MoE (8 experts) | No |
+| **Qwen2Adapter** | Qwen2, Qwen2.5, Qwen3 | GQA | RoPE | SwiGLU | No |
+| **GemmaAdapter** | Gemma, Gemma 2, Gemma 3 | GQA | RoPE | GeGLU | Yes |
+| **PhiAdapter** | Phi, Phi-2, Phi-3, Phi-4 | GQA | RoPE | SwiGLU | No |
+| **GPT2Adapter** | GPT-2, GPT-NeoX, GPT-J | MHA | Learned | SwiGLU | No |
+| **FalconAdapter** | Falcon | MQA | ALiBi | StdMLP | No |
+| **DeepSeekAdapter** | DeepSeek-V2/V3 | MLA (latent) | RoPE | DeepSeekMoE (64 experts, shared) | No |
+| **BloomAdapter** | BLOOM | MHA | ALiBi | StdMLP (GELU) | No |
+| **OPTAdapter** | OPT-125M-175B | MHA | Learned | GELU MLP | No |
+| **BaichuanAdapter** | Baichuan/2 | GQA | ALiBi | SwiGLU | No |
+| **YiAdapter** | Yi/Yi-1.5 | GQA | RoPE | SwiGLU | No |
+
+### Planned
+
+BLOOM, OPT, Baichuan, Yi, InternLM, DeepSeek, DeepSeek-V2/V3, Command-R
+
+### Compatibility Matrix
+
+| Architecture   | FP16/BF16 | FP8    | GPTQ   | AWQ    | INT8   | Status |
+|----------------|-----------|--------|--------|--------|--------|--------|
+| Llama/2/3/3.x  | Yes       | Planned| Planned| Planned| Planned| Active |
+| Mistral         | Yes       | Planned| Planned| Planned| Planned| Active |
+| Qwen2/2.5/3     | Yes       | Planned| Planned| Planned| Planned| Active |
+| Gemma/2/3       | Yes       | Planned| Planned| Planned| Planned| Active |
+| Phi/2/3/4       | Yes       | Planned| Planned| Planned| Planned| Active |
+| GPT-2/NeoX/J    | Yes       | -      | -      | -      | -      | Active |
+| Falcon          | Yes       | -      | -      | -      | -      | Active |
+| CodeLlama       | Yes       | Planned| Planned| Planned| Planned| Active |
+
+Features are only marked as supported when **tests pass**.
+
+---
+
+## Engine API
+
+### LLM
+
+```python
+from draco import LLM, SamplingParams
+
+# Load a model — auto-detects architecture from config.json
+llm = LLM(
+    model="meta-llama/Llama-3-8B",   # HF repo or local path
+    tokenizer=None,                   # defaults to model path
+    dtype="auto",                     # auto / float16 / bfloat16 / float32
+    max_model_len=8192,
+    gpu_memory_utilization=0.90,
+    tensor_parallel_size=1,
+    quantization=None,                # gptq / awq / fp8 / bitsandbytes
+    trust_remote_code=False,
+    seed=42,
+)
+
+# Generate text
+outputs = llm.generate(
+    prompts=["Hello, how are you?", "Tell me a joke"],
+    sampling_params=SamplingParams(temperature=0.7, max_tokens=256),
+)
+
+for output in outputs:
+    print(f"Prompt: {output.prompt!r}")
+    print(f"Text:   {output.outputs[0].text!r}")
+    print(f"Tokens: {len(output.outputs[0].token_ids)}")
+```
+
+### SamplingParams
+
+```python
+from draco.engine.sampling import SamplingParams
+
+# Default (greedy)
+params = SamplingParams()
+
+# Creative writing
+params = SamplingParams(
+    temperature=0.9,
+    top_p=0.95,
+    top_k=50,
+    max_tokens=512,
+    repetition_penalty=1.1,
+)
+
+# Precise / factual
+params = SamplingParams(
+    temperature=0.3,
+    top_p=0.8,
+    max_tokens=128,
+)
+
+# With stop conditions
+params = SamplingParams(
+    max_tokens=256,
+    stop=["\n\n", "END"],
+    stop_token_ids=[0, 2],
+)
+
+# Validate
+params = SamplingParams(temperature=-1)  # raises ValueError
+```
+
+**All parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `temperature` | 1.0 | Sampling temperature (0 = greedy) |
+| `top_p` | 1.0 | Nucleus sampling threshold |
+| `top_k` | -1 | Top-k sampling (-1 = disabled) |
+| `min_p` | 0.0 | Minimum probability threshold |
+| `max_tokens` | 16 | Maximum tokens to generate |
+| `min_tokens` | 0 | Minimum tokens to generate |
+| `stop` | None | Stop strings |
+| `stop_token_ids` | None | Stop token IDs |
+| `repetition_penalty` | 1.0 | Repetition penalty |
+| `frequency_penalty` | 0.0 | Frequency penalty |
+| `presence_penalty` | 0.0 | Presence penalty |
+| `seed` | None | Random seed |
+| `ignore_eos` | False | Ignore end-of-sequence token |
+| `n` | 1 | Number of completions |
+
+---
+
+## Model Registry
+
+The registry maps HuggingFace architecture strings to Draco adapter implementations.
+
+```python
+from draco.models.registry import MODEL_REGISTRY
+
+# List all registered architectures
+archs = MODEL_REGISTRY.list_architectures()
+print(f"Registered: {len(archs)} architectures")
+# ['FalconForCausalLM', 'GemmaForCausalLM', 'GPT2LMHeadModel', ...]
+
+# Look up an adapter
+adapter_cls = MODEL_REGISTRY.get("LlamaForCausalLM")
+
+# Resolve by architecture or model_type
+adapter_cls = MODEL_REGISTRY.resolve(
+    architecture="LlamaForCausalLM",
+    model_type="llama",
+)
+
+# Check if an architecture is registered
+assert "LlamaForCausalLM" in MODEL_REGISTRY
+
+# Get metadata
+meta = MODEL_REGISTRY.get_metadata("LlamaForCausalLM")
+print(meta)
+# {'model_type': 'llama', 'implementation': 'LlamaAdapter', ...}
+
+# Print full summary
+print(MODEL_REGISTRY.summary())
+```
+
+### Registering a new adapter
+
+```python
+from draco.models.adapter import ModelAdapter
+from draco.models.registry import MODEL_REGISTRY
+from draco.models.config import ModelConfig
+
+class MyModelAdapter(ModelAdapter):
+    @property
+    def architecture_name(self) -> str:
+        return "MyModelForCausalLM"
+
+    @property
+    def model_type(self) -> str:
+        return "my_model"
+
+    def build_model(self):
+        # Build and return the nn.Module
+        ...
+
+    def embed(self, input_ids):
+        ...
+
+    def attention(self, layer_idx, hidden_states, position_ids, kv_cache=None, attn_mask=None):
+        ...
+
+    def mlp(self, layer_idx, hidden_states):
+        ...
+
+    def norm(self, hidden_states):
+        ...
+
+    def lm_head(self, hidden_states):
+        ...
+
+    def rotary_embedding(self, position_ids, head_dim):
+        ...
+
+    def prepare_inputs(self, input_ids, position_ids, kv_cache=None, **kwargs):
+        ...
+
+    def load_weights(self, model, weight_path, **kwargs):
+        ...
+
+    def get_weight_map(self):
+        ...
+
+    # Dimension queries
+    def get_num_layers(self): ...
+    def get_hidden_size(self): ...
+    def get_num_heads(self): ...
+    def get_num_kv_heads(self): ...
+    def get_head_dim(self): ...
+    def get_vocab_size(self): ...
+
+# Register
+MODEL_REGISTRY.register(
+    architecture="MyModelForCausalLM",
+    implementation=MyModelAdapter,
+    model_type="my_model",
+    aliases=["MyModelV2ForCausalLM"],  # optional aliases
+    status="active",
+)
+```
+
+### Using the decorator form
+
+```python
+@MODEL_REGISTRY.register_decorator("MyModelForCausalLM", model_type="my_model")
+class MyModelAdapter(ModelAdapter):
+    ...
+```
+
+---
+
+## Metrics System
+
+### MetricsCollector
+
+```python
+from draco.metrics import MetricsCollector
+
+collector = MetricsCollector()
+
+# Record completed request metrics
+collector.record_request(
+    latency_ms=150.0,
+    ttft_ms=40.0,
+    itl_ms=8.0,
+    tpot_ms=7.5,
+    input_tokens=200,
+    output_tokens=128,
+)
+
+# Track active requests
+collector.request_start()
+collector.request_end()
+collector.enqueue_request()
+collector.set_batch_size(8)
+
+# Record speculative decoding metrics
+collector.record_speculative(
+    draft_tokens=500,
+    accepted_tokens=400,
+    rejected_tokens=100,
+    draft_latency_ms=5.0,
+    verify_latency_ms=12.0,
+)
+
+# Record quantization metrics
+collector.record_quantization(
+    method="gptq",
+    bits=4,
+    model_memory=2_000_000_000,
+    baseline_memory=8_000_000_000,
+)
+
+# Take a snapshot
+snapshot = collector.snapshot()
+
+# Access metric categories
+print(f"TTFT:          {snapshot.request.ttft_ms:.1f} ms")
+print(f"ITL:           {snapshot.request.itl_ms:.1f} ms")
+print(f"TPOT:          {snapshot.request.tpot_ms:.1f} ms")
+print(f"p50 latency:   {snapshot.request.p50_latency_ms:.1f} ms")
+print(f"p95 latency:   {snapshot.request.p95_latency_ms:.1f} ms")
+print(f"p99 latency:   {snapshot.request.p99_latency_ms:.1f} ms")
+print(f"Throughput:    {snapshot.generation.tokens_per_second:.1f} tok/s")
+print(f"GPU Memory:    {snapshot.gpu.allocated_memory_gb:.2f} GB")
+print(f"GPU Util:      {snapshot.gpu.utilization_percent:.1f}%")
+print(f"Active reqs:   {snapshot.scheduler.active_requests}")
+print(f"Queued reqs:   {snapshot.scheduler.queued_requests}")
+print(f"Batch size:    {snapshot.scheduler.batch_size}")
+print(f"Speculative:   {snapshot.speculative.acceptance_rate:.1%}")
+print(f"Quantization:  {snapshot.quantization.quantization_method}")
+print(f"Memory saved:  {snapshot.quantization.memory_reduction:.1%}")
+
+# Prometheus export
+prom = collector.to_prometheus()
+print(prom)
+# # HELP draco_requests_total Total requests processed
+# # TYPE draco_requests_total counter
+# draco_requests_total 42
+```
+
+### Metric types
+
+| Type | Fields |
+|------|--------|
+| `RuntimeMetrics` | `uptime_seconds`, `total_requests`, all sub-metrics |
+| `RequestMetrics` | `ttft_ms`, `itl_ms`, `tpot_ms`, `p50/p95/p99_latency_ms`, `total_tokens` |
+| `GPUMetrics` | `gpu_name`, `allocated_memory_gb`, `utilization_percent`, `temperature_celsius` |
+| `SchedulerMetrics` | `active_requests`, `queued_requests`, `batch_size`, `scheduler_utilization` |
+| `KVMetrics` | `num_blocks`, `utilization`, `hit_rate` |
+| `GenerationMetrics` | `tokens_per_second`, `prompt_tokens_per_second`, `avg_sequence_length` |
+| `SpeculativeMetrics` | `acceptance_rate`, `draft_tokens`, `accepted_tokens`, `speedup` |
+| `QuantizationMetrics` | `quantization_method`, `bits`, `memory_reduction` |
+
+---
+
+## Benchmarking
+
+### BenchmarkRunner
+
+```python
+from draco.benchmarks.framework import BenchmarkRunner, BenchmarkResult, EnvironmentInfo
+
+# Collect environment info
+env = EnvironmentInfo.collect()
+print(f"GPU: {env.gpu_model}")
+print(f"CUDA: {env.cuda_version}")
+print(f"PyTorch: {env.pytorch_version}")
+
+# Create runner
+runner = BenchmarkRunner(output_dir="benchmarks/results", save_results=True)
+
+# Run a benchmark
+def my_benchmark(batch_size=1, input_tokens=512, output_tokens=128, **kwargs):
+    # Your inference code here
+    import time
+    time.sleep(0.1)
+    return {
+        "ttft_ms": 42.0,
+        "tpot_ms": 8.0,
+        "itl_ms": 8.5,
+        "tokens_generated": output_tokens,
+        "gpu_memory_gb": 14.2,
+    }
+
+result = runner.run_benchmark(
+    name="llama3_8b_test",
+    benchmark_fn=my_benchmark,
+    model="Llama-3-8B",
+    dtype="bfloat16",
+    batch_size=1,
+    input_tokens=512,
+    output_tokens=128,
+    num_iterations=5,
+    warmup_iterations=1,
+)
+
+print(result.format_table())
+# Save to JSON automatically
+```
+
+### Benchmark modes
+
+```python
+from draco.benchmarks.modes import (
+    SingleRequestBenchmark,
+    ConcurrentRequestBenchmark,
+    BatchScalingBenchmark,
+    ContextScalingBenchmark,
+    GenerationScalingBenchmark,
+)
+
+# Single request — TTFT, latency, tokens/sec
+bench = SingleRequestBenchmark(runner)
+result = bench.run(llm, max_tokens=128)
+
+# Concurrent — test under parallel load
+bench = ConcurrentRequestBenchmark(runner)
+results = bench.run(llm, concurrency_levels=[1, 2, 4, 8, 16])
+
+# Batch scaling — throughput vs batch size
+bench = BatchScalingBenchmark(runner)
+results = bench.run(llm, batch_sizes=[1, 2, 4, 8, 16])
+
+# Context scaling — performance vs input length
+bench = ContextScalingBenchmark(runner)
+results = bench.run(llm, context_lengths=[512, 1024, 2048, 8192])
+
+# Generation scaling — performance vs output length
+bench = GenerationScalingBenchmark(runner)
+results = bench.run(llm, generation_lengths=[64, 256, 1024, 2048])
+```
+
+### Backend comparison
+
+```python
+from draco.benchmarks.comparison import ComparisonBenchmark
+
+comparator = ComparisonBenchmark(runner)
+comparison = comparator.compare(
+    backends=["draco", "vllm"],
+    model="Llama-3-8B",
+    input_tokens=512,
+    output_tokens=128,
+    num_iterations=5,
+)
+print(comparison)
+```
+
+---
+
+## CLI Reference
+
+```bash
+# Show model info (architecture, dimensions, registry status)
+draco info --model meta-llama/Llama-3-8B
+
+# Run a single benchmark
+draco bench --model meta-llama/Llama-3-8B \
+    --input-tokens 2048 --output-tokens 256
+
+# Batch scaling benchmark
+draco bench --model meta-llama/Llama-3-8B \
+    --mode batch_scaling --batch-sizes 1,2,4,8
+
+# Context scaling benchmark
+draco bench --model meta-llama/Llama-3-8B \
+    --mode context_scaling --context-lengths 512,2048,8192
+
+# Generation scaling benchmark
+draco bench --model meta-llama/Llama-3-8B \
+    --mode generation_scaling --generation-lengths 64,256,1024
+
+# Compare backends
+draco bench-compare --backend draco,vllm \
+    --model meta-llama/Llama-3-8B
+
+# Full options
+draco bench --help
+
+# --- Native CPU runtime ---
+
+# Convert a HF/safetensors model to the .draco format
+draco convert --model meta-llama/Llama-3-8B --output Llama-3-8B.draco --quantization int8
+
+# Inspect a .draco file (architecture, quantization, tensor count, CPU kernel availability)
+draco inspect Llama-3-8B.draco
+
+# Validate a .draco file's structural integrity (also handles non-.draco model configs)
+draco validate Llama-3-8B.draco
+
+# Detected CPU ISA, thread plan, and device="auto" resolution
+draco system-info
+```
+
+---
+
+## Weight Loading
+
+Draco supports multiple checkpoint formats via a unified loader:
+
+```python
+from draco.weights.loader import (
+    CheckpointLoader,
+    PyTorchLoader,
+    SafetensorsLoader,
+    HFLoader,
+    get_checkpoint_loader,
+)
+
+# Auto-detect format and load
+loader = get_checkpoint_loader()
+weights = loader.load("path/to/checkpoint")
+print(f"Loaded {len(weights)} tensors")
+
+# Detect format
+fmt = loader.detect_format("path/to/checkpoint")
+print(f"Format: {fmt}")  # SafetensorsLoader / PyTorchLoader / HFLoader
+
+# Iterate without loading all at once (memory-efficient)
+for name, tensor in loader.iter("path/to/checkpoint"):
+    print(f"{name}: {tensor.shape}")
+
+# Weight name mapping
+mapped = PyTorchLoader().map_weights(
+    weights={"transformer.h.0.weight": torch.randn(4, 4)},
+    weight_map={"transformer.h.0.weight": "model.layers.0.weight"},
+)
+
+# Sharded checkpoints (directory of .bin files)
+weights = loader.load("path/to/sharded/checkpoint/")
+```
+
+### Supported formats
+
+| Format | Extensions | Loader |
+|--------|-----------|--------|
+| Safetensors | `.safetensors` | `SafetensorsLoader` |
+| PyTorch | `.pth`, `.pt`, `.bin` | `PyTorchLoader` |
+| HuggingFace Hub | `org/model` | `HFLoader` |
+| Sharded | directory of above | Auto-detected |
+
+---
+
+## Attention Backends
+
+```python
+from draco.attention.base import (
+    MultiHeadAttention,
+    GroupedQueryAttention,
+    SlidingWindowAttention,
+    create_attention_backend,
+)
+
+# Factory function
+mha  = create_attention_backend(num_heads=8, num_kv_heads=8, head_dim=64, attn_type="MHA")
+gqa  = create_attention_backend(num_heads=8, num_kv_heads=2, head_dim=64, attn_type="GQA")
+mqa  = create_attention_backend(num_heads=8, num_kv_heads=1, head_dim=64, attn_type="MQA")
+sw   = create_attention_backend(num_heads=8, num_kv_heads=8, head_dim=64,
+                                 attn_type="SLIDING_WINDOW", window_size=256)
+
+# Forward pass
+q = torch.randn(2, 8, 32, 64)   # (batch, heads, seq_len, head_dim)
+k = torch.randn(2, 2, 32, 64)   # (batch, kv_heads, seq_len, head_dim)
+v = torch.randn(2, 2, 32, 64)
+out = gqa.forward(q, k, v)      # (2, 8, 32, 64)
+
+print(f"Type:  {gqa.attention_type.value}")
+print(f"Class: {type(gqa).__name__}")
+```
+
+---
+
+## Position Encodings
+
+```python
+from draco.position.rope import RotaryPositionEmbedding
+from draco.position.alibi import ALiBi
+
+position_ids = torch.arange(32).unsqueeze(0)  # (1, 32)
+
+# Standard RoPE
+rope = RotaryPositionEmbedding(
+    rope_theta=10000.0,
+    max_position_embeddings=128,
+    head_dim=64,
+)
+cos, sin = rope.forward(position_ids, head_dim=64)
+
+# NTK-aware RoPE (for longer contexts)
+ntk = RotaryPositionEmbedding(
+    rope_theta=10000.0,
+    max_position_embeddings=128,
+    head_dim=64,
+    rope_scaling={"type": "ntk", "factor": 4.0},
+)
+cos_ntk, sin_ntk = ntk.forward(position_ids, head_dim=64)
+
+# YaRN RoPE
+yarn = RotaryPositionEmbedding(
+    rope_theta=10000.0,
+    max_position_embeddings=128,
+    head_dim=64,
+    rope_scaling={"type": "yarn", "factor": 4.0},
+)
+
+# ALiBi (used by Falcon, BLOOM)
+alibi = ALiBi(num_heads=8, max_position_embeddings=128)
+bias, mask = alibi.forward(position_ids, head_dim=64)
+```
+
+---
+
+## Mixture of Experts
+
+```python
+from draco.models.moe.expert import Expert, ExpertGroup
+from draco.models.moe.router import TopKRouter
+from draco.models.moe.dispatch import TokenDispatcher
+
+# Router: decides which tokens go to which experts
+router = TopKRouter(hidden_dim=64, num_experts=8, top_k=2)
+
+# Expert group: the actual FFN experts
+experts = ExpertGroup(num_experts=8, hidden_dim=64, intermediate_dim=128)
+
+# Dispatch: route tokens to experts
+x = torch.randn(32, 64)
+indices, weights, aux = router.forward(x)
+output = experts.forward(x, indices, weights)
+
+print(f"Load balancing loss: {aux['load_balancing_loss'].item():.4f}")
+
+# Token dispatcher for capacity-limited routing
+dispatcher = TokenDispatcher(num_experts=8, expert_capacity=16)
+```
+
+---
+
+## Error Handling
+
+Draco uses a structured exception hierarchy:
+
+```python
+from draco.exceptions import (
+    DracoError,          # Base for all exceptions
+    ModelNotFoundError,  # Architecture not in registry
+    WeightLoadingError,  # Checkpoint loading failures
+    QuantizationError,   # Quantization operation failures
+    GPUError,            # GPU/CUDA failures
+    CheckpointError,     # Checkpoint format/reading errors
+    ConfigError,         # Model config invalid
+    KernelError,         # CUDA kernel unavailable
+    BenchmarkError,      # Benchmarking failures
+    MetricsError,        # Metrics collection failures
+    SchedulerError,      # Scheduler failures
+    KVCacheError,        # KV cache failures
+)
+
+# Catch at any level
+try:
+    raise ModelNotFoundError("NonExistentModel")
+except DracoError as e:
+    print(f"Caught at DracoError level: {type(e).__name__}")
+    # Caught at DracoError level: ModelNotFoundError
+```
+
+### SamplingParams validation
+
+```python
+from draco.engine.sampling import SamplingParams
+
+SamplingParams(temperature=-1)     # ValueError
+SamplingParams(top_p=2.0)          # ValueError
+SamplingParams(top_k=0)            # ValueError
+SamplingParams(max_tokens=-1)      # ValueError
+SamplingParams(repetition_penalty=0)  # ValueError
+```
+
+---
+
+## Configuration
+
+```python
+from draco.config import DracoConfig, get_config, set_config
+
+# Read defaults
+config = get_config()
+print(config.default_dtype)                    # "auto"
+print(config.default_max_model_len)            # 8192
+print(config.default_gpu_memory_utilization)   # 0.90
+print(config.max_num_seqs)                     # 256
+print(config.enable_paged_attention)           # True
+print(config.kv_cache_block_size)              # 16
+print(config.enable_metrics)                   # True
+
+# Override
+set_config(DracoConfig(
+    default_dtype="bfloat16",
+    max_num_seqs=512,
+    enable_paged_attention=False,
+    verbose=True,
+))
+```
+
+---
+
+## Logging
+
+```python
+from draco.logging import get_logger, set_log_level
+
+# Get a logger (inherits from root "draco" logger)
+logger = get_logger("draco.engine")
+logger.info("Engine starting")
+
+# Set log level
+set_log_level("DEBUG")
+set_log_level(10)  # numeric
+```
+
+---
+
+## Project Structure
+
+```
+DracoRT/
++-- draco/
+|   +-- __init__.py               # LLM, SamplingParams, registries
+|   +-- config.py                 # DracoConfig, get/set_config|   +-- exceptions.py             # 12 exception types (DracoError + 11) |   +-- logging.py                # get_logger, set_log_level
+|   |
+|   +-- engine/
+|   |   +-- llm.py                # LLM engine, RequestOutput, CompletionOutput
+|   |   +-- sampling.py           # SamplingParams dataclass
+|   |
+|   +-- models/
+|   |   +-- adapter.py            # ModelAdapter ABC (30+ methods)
+|   |   +-- config.py             # ModelConfig, AttentionConfig, MoEConfig, etc.
+|   |   +-- registry.py           # MODEL_REGISTRY singleton
+|   |   +-- executor.py           # ModelExecutor
+|   |   +-- runner.py             # ModelRunner
+|   |   +-- _register_all.py      # Auto-registers all adapters
+|   |   +-- llama/                # LlamaAdapter
+|   |   +-- mistral/              # MistralAdapter
+|   |   +-- qwen2/                # Qwen2Adapter
+|   |   +-- gemma/                # GemmaAdapter
+|   |   +-- phi/                  # PhiAdapter
+|   |   +-- gpt2/                 # GPT2Adapter|   |   +-- falcon/               # FalconAdapter
+|   |   +-- mixtral/              # MixtralAdapter (sparse MoE)
+|   |   +-- moe/                  # Router, ExpertGroup, TokenDispatcher |   |
+|   +-- attention/
+|   |   +-- base.py               # ABCs + create_attention_backend()
+|   |   +-- mha.py                # MultiHeadAttention
+|   |   +-- gqa.py                # GroupedQueryAttention (also MQA)
+|   |   +-- sliding_window.py     # SlidingWindowAttention
+|   |
+|   +-- position/
+|   |   +-- base.py               # PositionEncoding ABC
+|   |   +-- rope.py               # RotaryPositionEmbedding (RoPE/NTK/YaRN)
+|   |   +-- alibi.py              # ALiBi
+|   |
+|   +-- quantization/
+|   |   +-- base.py               # QuantizationBackend ABC
+|   |   +-- config.py             # QuantizationConfig
+|   |   +-- registry.py           # QUANT_REGISTRY singleton
+|   |   +-- gptq.py               # GPTQBackend (INT4/INT3)
+|   |   +-- awq.py                # AWQBackend (W4A16)
+|   |   +-- fp8.py                # FP8Backend (E4M3/E5M2)
+|   |   +-- bitsandbytes.py       # BitsAndBytesBackend (NF4/FP4/INT8)
+|   |   +-- _register_all.py      # Auto-registers all backends
+|   |
+|   +-- metrics/
+|   |   +-- types.py              # 8 metric dataclasses
+|   |   +-- collector.py          # MetricsCollector + Prometheus export
+|   |   +-- registry.py           # MetricsRegistry (extensible)
+|   |
+|   +-- benchmarks/
+|   |   +-- framework.py          # BenchmarkRunner, BenchmarkResult, EnvironmentInfo
+|   |   +-- modes.py              # 5 benchmark modes
+|   |   +-- comparison.py         # ComparisonBenchmark
+|   |
+|   +-- weights/
+|   |   +-- loader.py             # Safetensors/PyTorch/HF/Sharded loaders
+|   |
+|   +-- cli/
+|   |   +-- main.py               # draco CLI (bench, bench-compare, info)
+|   ||   +-- scheduler/
+|   |   +-- scheduler.py          # ContinuousBatchScheduler, SchedulerRequest
+|   +-- kv_cache/
+|   |   +-- block.py              # KVCacheBlock, KVCacheBlockManager
+|   +-- engine/
+|   |   +-- stream.py             # StreamingGenerator, StreamOutput, StreamDelta
+|   |   +-- speculative.py        # SpeculativeDecoder, SpeculativeConfig
+|   |   +-- async_llm.py          # AsyncLLM (async/await API)
+|   |   +-- chunked_prefill.py    # ChunkedPrefiller
+|   +-- prefix_cache/
+|   |   +-- radix.py              # PrefixCache (radix tree)
+|   +-- server/
+|   |   +-- app.py                # DracoServer, OpenAI-compatible API
+|   +-- kernels/                  # (planned: CUDA kernels)
++-- tests/                        # 769 tests across 41 files
++-- benchmarks/                   # Benchmark configs and results
++-- demo.py                       # 28-section interactive demo
++-- pyproject.toml
++-- README.md
++-- ROADMAP.md
+```
+
+---
+
+## Test Suite
+
+**821 tests** across 42 test files, all passing:
+
+| File | Tests | What it covers |
+|------|-------|----------------|
+| `test_models.py` | 38 | ModelConfig parsing, registry, adapter forward passes |
+| `test_quant_backends.py` | 34 | GPTQ/AWQ/FP8/bnb dequantize, memory, kernels |
+| `test_weights.py` | 33 | Loaders, sharding, mapping, format detection |
+| `test_adapters.py` | 32 | Per-adapter features: attention type, position, MLP, tied embeddings |
+| `test_benchmarks.py` | 27 | Runner, result, environment, modes, comparison |
+| `test_integration.py` | 26 | End-to-end: config -> model -> generate -> metrics |
+| `test_quantization.py` | 26 | QuantizationConfig, registry, backends |
+| `test_metrics.py` | 22 | MetricsCollector, snapshot, percentiles, Prometheus |
+| `test_attention.py` | 20 | MHA/GQA/MQA/SlidingWindow forward, factory |
+| `test_engine.py` | 18 | SamplingParams validation, LLM engine |
+| `test_metrics_registry.py` | 16 | MetricsRegistry collector/exporter registration |
+| `test_executor.py` | 16 | ModelExecutor init, forward, info |
+| `test_position.py` | 13 | RoPE/NTK/YaRN/ALiBi |
+| `test_exceptions.py` | 14 | All 11 exception types, hierarchy |
+| `test_cli.py` | 11 | CLI argument parsing |
+| `test_moe.py` | 12 | Expert, ExpertGroup, Router, Dispatcher |
+| `test_logging.py` | 12 | Logger, handlers, log levels |
+| `test_config.py` | 6 | DracoConfig defaults, singleton |
+| `test_mixtral.py` | 26 | Mixtral adapter: MoE, sliding window, GQA, forward pass |
+| `test_kv_cache.py` | 19 | Block allocation, deallocation, space reservation |
+| `test_scheduler.py` | 18 | Continuous batching, priority, preemption |
+| `test_streaming.py` | 9 | Streaming output, delta accumulation |
+| `test_speculative.py` | 14 | Speculative decoding, stats, acceptance rate |
+| `test_prefix_cache.py` | 35 | Radix tree insert, lookup, eviction, hit rate |
+| `test_server.py` | 38 | OpenAI server, request/response types, parsing |
+| `test_chunked_prefill.py` | 30 | Prompt splitting, prefill state, interleaving |
+| `test_async_llm.py` | 11 | Async LLM creation, error handling |
+| `test_deepseek.py` | 23 | DeepSeek MLA, MoE, adapter, forward pass |
+| `test_bloom.py` | 18 | BLOOM ALiBi, adapter, parallel residual, forward |
+| `test_paged_attention.py` | 15 | PagedAttention, block manager, GQA, causal mask |
+| `test_rate_limiter.py` | 24 | Token bucket, per-user limits, reset, stats |
+| `test_tensor_parallel.py` | 16 | Split/merge, Column/RowParallel, partition plan |
+| `test_opt.py` | 12 | OPT adapter, learned positions, forward pass |
+| `test_baichuan.py` | 14 | Baichuan ALiBi, SwiGLU, GQA, forward pass |
+| `test_yi.py` | 12 | Yi GQA, RoPE, SwiGLU, forward pass |
+| `test_pipeline.py` | 20 | Pipeline plan, partition, communicator, scheduler |
+| `test_health.py` | 15 | Health checks: liveness, readiness, startup probes |
+| `test_structured_logging.py` | 13 | JSON formatter, request ID, timer |
+| `test_kernels.py` | 17 | fused_rms_norm, rope, swiGLU, attention |
+| `test_runner.py` | 8 | ModelRunner creation, forward |
+| `test_production_benchmarks.py` | 52 | Production benchmarks: throughput, scheduler, cache, batch, quant, speculative, prefix cache, streaming, metrics, server, quality gate |
+| `conftest.py` | - | Shared fixtures for all tests |
+
+Run tests:
+```bash
+python -m pytest tests/ -v                     # verbose
+python -m pytest tests/ -v --tb=short          # short tracebacks
+python -m pytest tests/test_models.py -v       # specific file
+python -m pytest tests/ -k "test_forward"      # by name pattern
+```
+
+---
+
+## Demo
+
+`demo.py` runs 38 self-contained sections with no GPU or downloads required:
+
+| # | Section | What it shows |
+|---|---------|---------------|
+| 1 | Model Registry | All 16 registered architectures |
+| 2 | Config Parsing | Llama 3.1 8B, Qwen2.5 72B, Mistral 7B configs |
+| 3 | Build Model | Tiny Llama forward pass with timing |
+| 4 | Multi-Architecture | Forward passes across 5 adapters |
+| 5 | Quantization | 4 backends, auto-detection, memory estimation |
+| 6 | Metrics | Simulated requests, Prometheus export |
+| 7 | Attention | MHA/GQA/MQA/SlidingWindow forward passes |
+| 8 | Position Encodings | RoPE/NTK/YaRN/ALiBi |
+| 9 | MoE | Router + ExpertGroup with routing distribution |
+| 10 | Sampling | Greedy/Creative/Balanced/Precise presets |
+| 11 | Weight Loading | PyTorch checkpoints, sharding, weight mapping |
+| 12 | Benchmarks | Environment info, quick benchmark, comparison |
+| 13 | Benchmark Modes | Overview of 5 benchmark modes |
+| 14 | End-to-End Generation | Prefill + 16-step autoregressive decode |
+| 15 | Error Handling | Exception hierarchy, validation |
+| 16 | System Summary | All subsystems at a glance |
+| 17 | Adapter Features | Per-adapter differences table |
+| 18 | Compatibility Matrix | 7 architectures x 4 quantization methods |
+| 19 | Metrics Registry | Extensible collectors and exporters |
+| 20 | Config / Logging / CLI | Global config, log levels, CLI help, exception hierarchy |
+| 21 | Mixtral MoE | Sparse MoE with 8 experts, top-2 routing |
+| 22 | Paged KV Cache | Block allocation, deallocation, space reservation |
+| 23 | Scheduler | Continuous batching, priority, dynamic batch formation |
+| 24 | Streaming & Speculative | StreamOutput, SpeculativeDecoder, acceptance stats |
+| 25 | OpenAI Server | /v1/completions, /v1/chat/completions, /v1/models, /health |
+| 26 | Prefix Cache | Radix tree lookup, insert, eviction, hit rate |
+| 27 | Chunked Prefill | Prompt splitting, per-request tracking, interleaving |
+| 28 | Async API | AsyncLLM, async generate, stream, encode/decode |
+| 29 | DeepSeek (MLA+MoE) | MLA attention, DeepSeekMoE with shared experts |
+| 30 | BLOOM (ALiBi) | ALiBi attention, parallel residual, LayerNorm |
+| 31 | PagedAttention | Block-based attention, KV cache blocks, decode step |
+| 32 | Rate Limiter | Token bucket, per-user limits, global burst |
+| 33 | Tensor Parallelism | Split/merge, Column/Row parallel, partition plan |
+| 34 | CUDA Kernels | Fused RMSNorm, RoPE, SwiGLU, Attention (reference) |
+| 35 | OPT (Learned Pos) | Learned position embeddings, sequential residual |
+| 36 | Baichuan (ALiBi) | ALiBi attention, SwiGLU, GQA |
+| 37 | Yi (GQA+RoPE) | Grouped-query attention, rotary embeddings, SwiGLU |
+| 38 | Pipeline Parallel | Layer partitioning, micro-batch scheduling, communicator |
+
+Run:
+```bash
+python demo.py              # all 38 sections
+python demo.py 1 3 5        # specific sections only
+python demo.py 14 15 16     # end-to-end + errors + summary
+python demo.py 25 26 27 28  # server + prefix cache + chunked prefill + async
+```
+
+---
+
+## Contributing
+
+New model adapters should implement `ModelAdapter` and register in `draco/models/_register_all.py`.
+
+New quantization backends should extend `QuantizationBackend` and register in `draco/quantization/_register_all.py`.
+
+All changes must:
+1. Add tests in the corresponding `tests/test_*.py` file
+2. Pass the full test suite: `python -m pytest tests/ -v`
+3. Follow the existing code conventions
+
+---
+
+## Installation
+
+```bash
+# Basic
+pip install draco-llm
+
+# With quantization support
+pip install draco-llm[quantization]
+
+# With benchmarking
+pip install draco-llm[bench]
+
+# Full
+pip install draco-llm[all]
+
+# Development
+pip install draco-llm[dev]
+```
+
+## Requirements
+
+- Python >= 3.10
+- PyTorch >= 2.1.0
+- CUDA 11.8+ (for GPU inference)
+- GPU with compute capability >= 7.0
+
+---
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for the full 15-level roadmap.
+
+**Current status: Levels 1-5, 8-14 implemented. 769 tests passing.**
+
+| Level | Description | Status |
+|-------|-------------|--------|
+| 1 | Basic GPU Runtime | Done |
+| 2 | Scheduler + Runtime | Done |
+| 3 | Paged KV Cache + PagedAttention | Done |
+| 4 | Native CUDA Kernels | Reference implementations done |
+| 5 | Continuous Batching | Done (incl. chunked prefill) |
+| 6 | Universal Model Support | 13 adapters, 25 architectures |
+| 7 | Universal Quantization | 4 backends |
+| 8 | Speculative Decoding | Done |
+| 9 | Multi-GPU | Tensor + Pipeline parallelism done |
+| 10 | Prefix Caching | Done (radix tree) |
+| 11 | Streaming + Async | Done (sync + async + SSE) |
+| 12 | Metrics + Observability | Done (incl. structured logging) |
+| 13 | Benchmarking | Done |
+| 14 | OpenAI-Compatible Server | Done (rate limiting + health checks) |
+| 15 | vLLM-Level Runtime | Foundation complete |
+| 16 | Native CPU Runtime (`.draco` format) | Done — format, INT8/INT4/bf16 quantization+storage, execution graph (3 architecture families), KV cache, continuous batching, adaptive speculative decoding (all portable-numpy tier) |
+| 17 | ISA-specific CPU kernels (AVX2/AVX512/VNNI/AMX/NEON) | Not started — needs a compiled extension + real hardware to validate against |
+| 18 | GPU memory planning + OOM avoidance/recovery utilities | Done — `GPUMemoryPlanner`, `run_with_oom_backoff` (untested against a real GPU; no CUDA device available in-session) |
+
+---
+
+## Known Limitations
+
+- `LLM(...)` defaults to `backend="transformers"` (v0.8.0+) specifically because Draco's own native engine (`backend="draco"`) has real, known gaps documented below — use `backend="draco"` deliberately, not as a default
+- Draco's native engine (`backend="draco"`) has no per-adapter KV cache: `_generate_single` and `StreamingGenerator.stream` re-feed the full sequence every decode step (fixed a real bug where feeding only the latest token — combined with adapters recomputing `position_ids` from zero every call — produced degenerate/repeating output after the first step or two). Both paths are now validated against a real model (Qwen2.5-0.5B-Instruct on CPU): responses stop naturally and are coherent
+- `backend="draco"` generation is O(n²) in sequence length (no KV cache reuse) until the existing paged-KV-cache machinery (`draco/kv_cache/block.py`, `draco/scheduler/scheduler.py`) is actually wired into `ModelExecutor.forward()` — that wiring is a separate, larger undertaking, not done in this pass
+- For instruction-tuned models (Qwen2.5, Llama-3, ...) the native `generate()` path now applies the tokenizer's chat template automatically (single user turn, `add_generation_prompt=True`) so generation starts from the "assistant" turn and stops on the model's chat end token (e.g. `<|im_end|>`), and stops on every EOS id declared in `generation_config.json` — raw-text completion on an instruct model requires passing an already-formatted prompt (any prompt containing a special-token string is left untouched)
+- `backend="draco"` only supports the 25 architectures registered in `MODEL_REGISTRY`; newer or multimodal ("ForConditionalGeneration") architectures raise `ModelNotFoundError` there — use the default `backend="transformers"` for those
+- No GPU required for tests/demo, but real inference requires CUDA 11.8+ and compute capability >= 7.0
+- No pipeline parallelism or NCCL multi-GPU communication (tensor parallelism done)
+- Quantization backends require external libraries (auto-gptq, autoawq, bitsandbytes)
+- GPT-2, Falcon, and BLOOM adapters use non-RoPE position encodings (learned/ALiBi) — no long-context extension
+- OPT, Baichuan, Yi, and other architectures not yet supported
+- Weight loading is CPU-first — no direct GPU memory-mapped loading
+- Benchmark modes are CPU/simulated — real GPU benchmarks require model weights
+- CUDA kernels are reference PyTorch implementations — custom GPU kernels not yet built
+- Native CPU runtime (`.draco`) only has the portable numpy kernel tier — no AVX2/AVX512/AMX-optimized GEMM yet, so it is not expected to be faster than llama.cpp/GGUF; the format, quantization, execution graph, batching, and speculative decoding are real and tested, the raw kernel speed is not yet optimized
+- Native CPU runtime supports 3 architecture families (Llama/Qwen2/Mistral-style RoPE+RMSNorm+gated-MLP, GPT-2-style learned-position+LayerNorm+fused-QKV, BLOOM-style ALiBi+LayerNorm) — not all 13 GPU-side adapters' exact attention/MLP variants (e.g. Falcon's parallel attention+MLP, true multi-query attention) are wired into the CPU executor yet
+- Native CPU speculative decoding is draft-model-free (prompt-lookup only) — it helps on repetitive continuations and does nothing extra on novel text (falls back to plain greedy for that step, still correct)
+- GPU memory planning (`GPUMemoryPlanner`) and OOM-recovery (`run_with_oom_backoff`) are implemented and unit-tested with mocked failures, but not validated against a real GPU/real OOM condition — no CUDA device is available in this development environment
+
+---
+
+## License
+
+Apache 2.0
