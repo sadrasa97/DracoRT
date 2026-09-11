@@ -1,0 +1,2 @@
+[console_scripts]
+draco = draco.cli:main

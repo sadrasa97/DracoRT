@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "draco-llm"
+version = "0.8.0"
+description = "Universal GPU LLM Runtime"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Draco Team"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1.0",
+    "numpy>=1.24.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.20.0",
+    "transformers>=4.37.0",
+    "pydantic>=2.0.0",
+    "filelock>=3.13.0",
+    "tqdm>=4.66.0",
+    "py-cpuinfo>=9.0.0",
+    "aiohttp>=3.9.0",
+]
+
+[project.optional-dependencies]
+quantization = [
+    "auto-gptq>=0.7.0",
+    "autoawq>=0.2.0",
+    "bitsandbytes>=0.43.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.2.0",
+    "mypy>=1.8.0",
+    "black>=24.0.0",
+]
+bench = [
+    "pandas>=2.1.0",
+    "matplotlib>=3.8.0",
+    "tabulate>=0.9.0",
+]
+all = [
+    "draco-llm[quantization,dev,bench]",
+]
+
+[project.scripts]
+draco = "draco.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["draco*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: marks tests that require GPU",
+    "slow: marks tests as slow",
+    "quantization: marks quantization-specific tests",
+]
